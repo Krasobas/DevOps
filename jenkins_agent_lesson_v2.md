@@ -23,27 +23,25 @@ SSH-ключи нужны для того, чтобы контейнер Jenkins
 при пересоздании контейнеров:
 
 ```bash
-mkdir -p ~/jenkins-server/ssh-keys
-ssh-keygen -t ed25519 -C "jenkins-agent" -f ~/jenkins-server/ssh-keys/jenkins_agent_key -N ""
+cd ~/jenkins-server
+make ssh-keys
 ```
 
-Параметры:
-- `-t ed25519` — современный алгоритм (быстрее и безопаснее RSA).
-- `-C "jenkins-agent"` — комментарий для идентификации ключа.
-- `-f ...` — путь к файлу ключа.
-- `-N ""` — пустая парольная фраза (для автоматического подключения).
-
-Будут созданы два файла:
+Эта команда создаст два файла в папке `ssh-keys/`:
 - `jenkins_agent_key` — приватный ключ (его добавим в Jenkins).
 - `jenkins_agent_key.pub` — публичный ключ (его передадим агенту).
 
-## 2. Обновление compose.yaml
-
-Перейдите в директорию проекта:
+Под капотом выполняется:
 
 ```bash
-cd ~/jenkins-server
+ssh-keygen -t ed25519 -C "jenkins-agent" -f ssh-keys/jenkins_agent_key -N ""
 ```
+
+- `-t ed25519` — современный алгоритм (быстрее и безопаснее RSA).
+- `-C "jenkins-agent"` — комментарий для идентификации ключа.
+- `-N ""` — пустая парольная фраза (для автоматического подключения).
+
+## 2. Обновление compose.yaml
 
 Обновите `compose.yaml`, добавив сервис агента и сеть:
 
@@ -95,47 +93,153 @@ volumes:
   Образ `jenkins/ssh-agent` при запуске автоматически добавит этот ключ
   в `authorized_keys` пользователя `jenkins` внутри контейнера агента.
 
-## 3. Запуск
+## 3. Makefile
 
-Запустите обновлённый стек. Публичный ключ передаём через переменную окружения:
+Команда запуска требует передачи переменных окружения `DOCKER_GID` и `JENKINS_SSH_PUBKEY`.
+Чтобы не запоминать их и не ошибиться, вынесем все операции в `Makefile`:
+
+```makefile
+# Jenkins CI/CD Server Management
+# Usage: make [target]
+
+DOCKER_GID := $(shell getent group docker | cut -d: -f3)
+JENKINS_SSH_PUBKEY := $(shell cat ssh-keys/jenkins_agent_key.pub 2>/dev/null)
+
+export DOCKER_GID
+export JENKINS_SSH_PUBKEY
+
+# ── Lifecycle ───────────────────────────────────────────
+
+.PHONY: up down start stop restart build
+
+up: ## Build and start all services
+	docker compose up -d --build
+
+down: ## Stop and remove containers (data preserved in volumes)
+	docker compose down
+
+start: ## Start stopped containers
+	docker compose start
+
+stop: ## Stop running containers
+	docker compose stop
+
+restart: ## Restart all services
+	docker compose restart
+
+build: ## Rebuild images without starting
+	docker compose build
+
+# ── Setup ───────────────────────────────────────────────
+
+.PHONY: ssh-keys
+
+ssh-keys: ## Generate SSH keys for Jenkins agent
+	mkdir -p ssh-keys
+	ssh-keygen -t ed25519 -C "jenkins-agent" -f ssh-keys/jenkins_agent_key -N ""
+	@echo "SSH keys generated in ssh-keys/"
+
+# ── Info & Logs ─────────────────────────────────────────
+
+.PHONY: ps logs logs-jenkins logs-agent
+
+ps: ## Show running containers
+	docker compose ps
+
+logs: ## Tail logs from all services
+	docker compose logs -f
+
+logs-jenkins: ## Tail Jenkins logs
+	docker compose logs -f jenkins
+
+logs-agent: ## Tail agent logs
+	docker compose logs -f agent1
+
+# ── Shell Access ────────────────────────────────────────
+
+.PHONY: shell-jenkins shell-agent
+
+shell-jenkins: ## Open shell in Jenkins container
+	docker compose exec jenkins bash
+
+shell-agent: ## Open shell in agent container
+	docker compose exec agent1 bash
+
+# ── Checks ──────────────────────────────────────────────
+
+.PHONY: check-ssh check-docker
+
+check-ssh: ## Test SSH connection from Jenkins to agent
+	docker compose exec jenkins ssh -i /var/jenkins_home/.ssh/jenkins_agent_key -o StrictHostKeyChecking=no jenkins@agent1 "echo 'SSH OK'"
+
+check-docker: ## Verify Docker CLI inside Jenkins
+	docker compose exec jenkins docker --version
+	docker compose exec jenkins docker compose version
+
+# ── Danger Zone ─────────────────────────────────────────
+
+.PHONY: nuke
+
+nuke: ## Remove everything including volumes (ALL DATA LOST)
+	@echo "This will delete ALL Jenkins data. Press Ctrl+C to cancel."
+	@sleep 3
+	docker compose down -v
+
+# ── Help ────────────────────────────────────────────────
+
+.PHONY: help
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+
+.DEFAULT_GOAL := help
+```
+
+Ключевые моменты:
+
+- **Переменные вычисляются автоматически** — `DOCKER_GID` и `JENKINS_SSH_PUBKEY`
+  определяются в шапке Makefile. Не нужно ничего запоминать и копировать вручную.
+- **`make` без аргументов** выводит справку — список всех доступных команд с описанием.
+- **`.PHONY`** — указывает make, что эти таргеты не являются файлами.
+  Без этого, если в директории окажется файл с именем `up`, make решит,
+  что "файл уже существует" и не выполнит команду.
+
+## 4. Запуск
 
 ```bash
 cd ~/jenkins-server
-
-DOCKER_GID=$(getent group docker | cut -d: -f3) \
-JENKINS_SSH_PUBKEY="$(cat ssh-keys/jenkins_agent_key.pub)" \
-docker compose up -d --build
+make up
 ```
 
 Проверьте, что оба контейнера запущены:
 
 ```bash
-docker compose ps
+make ps
 ```
 
 Должны увидеть два контейнера (`jenkins` и `agent1`) в состоянии `Up`.
 
-## 4. Проверка SSH-подключения
+## 5. Проверка SSH-подключения
 
-Прежде чем настраивать Jenkins, убедимся, что SSH-подключение работает.
-
-Зайдите в контейнер Jenkins:
+Прежде чем настраивать Jenkins, убедимся, что SSH-подключение работает:
 
 ```bash
-docker compose exec jenkins bash
+make check-ssh
 ```
 
-Попробуйте подключиться к агенту по имени:
+Если всё в порядке, увидите вывод `SSH OK`.
+
+Если нужно отладить вручную:
 
 ```bash
+make shell-jenkins
 ssh -i /var/jenkins_home/.ssh/jenkins_agent_key jenkins@agent1
 ```
 
-На вопрос о fingerprint ответьте `yes`. Если подключение прошло успешно —
-вы увидите приглашение командной строки агента. Введите `exit` дважды,
-чтобы вернуться на хост-машину.
+На вопрос о fingerprint ответьте `yes`. После успешного подключения введите `exit` дважды.
 
-## 5. Добавление ключа в Jenkins
+## 6. Добавление ключа в Jenkins
 
 Откройте Jenkins в браузере: `http://<IP_ВАШЕГО_СЕРВЕРА>:9074`
 
@@ -164,7 +268,7 @@ cat ~/jenkins-server/ssh-keys/jenkins_agent_key
 
 4. Нажмите **Create**.
 
-## 6. Настройка Node в Jenkins
+## 7. Настройка Node в Jenkins
 
 1. Перейдите в **Manage Jenkins** → **Nodes**.
 2. Нажмите **New Node**.
@@ -187,7 +291,7 @@ cat ~/jenkins-server/ssh-keys/jenkins_agent_key
 | Credentials | jenkins (тот, что создали выше) |
 | Host Key Verification Strategy | Non verifying Verification Strategy |
 
-**Host: `agent1`** — это имя контейнера, а не IP-адрес. Оно работает стабильно
+**Host: `agent1`** — имя контейнера, а не IP-адрес. Работает стабильно
 благодаря Docker-сети `jenkins-net`. При перезапуске контейнера IP может измениться,
 но имя останется прежним.
 
@@ -199,7 +303,7 @@ cat ~/jenkins-server/ssh-keys/jenkins_agent_key
 
 5. Нажмите **Save**.
 
-## 7. Проверка
+## 8. Проверка
 
 После сохранения Jenkins начнёт подключаться к агенту. Подождите несколько секунд.
 
@@ -209,36 +313,38 @@ cat ~/jenkins-server/ssh-keys/jenkins_agent_key
    и есть строка `Agent successfully connected and online`.
 
 Если агент не подключается, проверьте:
-- Оба контейнера запущены: `docker compose ps`
-- SSH работает: `docker compose exec jenkins ssh -i /var/jenkins_home/.ssh/jenkins_agent_key jenkins@agent1`
+- Оба контейнера запущены: `make ps`
+- SSH работает: `make check-ssh`
 - Credentials в Jenkins используют правильный приватный ключ
 - В настройках Node указан Host `agent1`, а не IP-адрес
 
-## Полезные команды
+## Краткая справка по командам
 
 ```bash
-# Просмотр логов агента
-docker compose logs -f agent1
-
-# Перезапуск агента
-docker compose restart agent1
-
-# Зайти внутрь контейнера агента
-docker compose exec agent1 bash
-
-# Проверить версию Java на агенте
-docker compose exec agent1 java -version
+make              # показать все доступные команды
+make up           # собрать и запустить всё
+make down         # остановить (данные сохраняются)
+make ps           # статус контейнеров
+make logs         # логи всех сервисов
+make logs-agent   # логи агента
+make check-ssh    # проверить SSH между Jenkins и агентом
+make check-docker # проверить Docker CLI внутри Jenkins
+make shell-jenkins # зайти в контейнер Jenkins
+make shell-agent  # зайти в контейнер агента
+make nuke         # удалить всё включая данные (осторожно!)
 ```
 
 ## Итоговая структура проекта
 
 ```
 ~/jenkins-server/
-├── Dockerfile           # Образ Jenkins с Docker CLI
-├── compose.yaml         # Jenkins + Agent
+├── Dockerfile              # Образ Jenkins с Docker CLI
+├── Makefile                # Управление проектом
+├── compose.yaml            # Jenkins + Agent
+├── .gitignore              # Исключения для Git
 └── ssh-keys/
-    ├── jenkins_agent_key      # Приватный ключ (не коммитим в git!)
-    └── jenkins_agent_key.pub  # Публичный ключ
+    ├── jenkins_agent_key       # Приватный ключ (не коммитим!)
+    └── jenkins_agent_key.pub   # Публичный ключ
 ```
 
 Если проект хранится в Git, добавьте ключи в `.gitignore`:
@@ -249,8 +355,10 @@ echo "ssh-keys/" >> .gitignore
 
 ## Задание
 
-1. Сгенерируйте SSH-ключи для подключения агента.
+1. Сгенерируйте SSH-ключи: `make ssh-keys`.
 2. Обновите compose.yaml, добавив сервис agent1.
-3. Настройте Credentials и Node в Jenkins.
-4. Убедитесь, что агент подключился (статус "online" в логе).
-5. Отправьте скриншот списка Nodes в Jenkins.
+3. Запустите стек: `make up`.
+4. Проверьте SSH: `make check-ssh`.
+5. Настройте Credentials и Node в Jenkins.
+6. Убедитесь, что агент подключился (статус "online" в логе).
+7. Отправьте скриншот списка Nodes в Jenkins.
