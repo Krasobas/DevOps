@@ -855,3 +855,605 @@ tasks.named<Test>("test") {
 | author в include | `author="Petr Arsentev"` в include | author только в changeset |
 | driver-class-name | Указан явно | Убран (автоопределение) |
 | Validate | Не упоминался | Обязательный этап перед update |
+
+
+# Урок 7. Liquibase в production: чеклист выживания
+
+В предыдущих уроках мы настроили Liquibase, научились писать changesets, откатывать их и интегрировать в CI/CD. Всё это работает красиво на localhost с пустой базой и одним разработчиком.
+
+Production — это другой мир. Там таблицы на сотни миллионов строк, два инстанса приложения работают одновременно, DBA звонит в 3 часа ночи, и команда из 8 человек мержит миграции в один main.
+
+Этот урок — коллекция граблей, на которые наступали десятки команд до вас. Каждый пункт — это чей-то потерянный выходной.
+
+---
+
+## 1. Залипший DATABASECHANGELOGLOCK
+
+### Что происходит
+
+Liquibase перед выполнением миграций ставит блокировку в таблице `databasechangeloglock`. Это защита от одновременного запуска двух миграций. После завершения — блокировка снимается.
+
+Но если процесс убит принудительно (Ctrl+C, OOM killer, рестарт контейнера, таймаут Jenkins) — блокировка остаётся. Следующий запуск видит `LOCKED = TRUE` и ждёт. Бесконечно.
+
+### Как выглядит
+
+```
+Waiting for changelog lock....
+Waiting for changelog lock....
+Waiting for changelog lock....
+```
+
+Разработчик ждёт 5 минут, решает что "зависло", убивает процесс. Запускает заново. Та же картина. Паника.
+
+### Диагностика
+
+```sql
+SELECT locked, lockgranted, lockedby FROM databasechangeloglock;
+```
+
+Если `locked = true`, а `lockgranted` было вчера — это залипший lock.
+
+### Решение
+
+Вариант 1 — через Liquibase:
+
+```bash
+./gradlew releaseLocks -P"dotenv.filename"="env/.env.develop"
+```
+
+Вариант 2 — через SQL (если Gradle тоже завис на lock):
+
+```sql
+UPDATE databasechangeloglock
+SET locked = false, lockgranted = null, lockedby = null
+WHERE id = 1;
+```
+
+### Правило
+
+Используйте только когда вы **уверены**, что никакая другая миграция не выполняется прямо сейчас. Если сомневаетесь — проверьте через `pg_stat_activity`:
+
+```sql
+SELECT pid, state, query, query_start
+FROM pg_stat_activity
+WHERE datname = 'job4j_devops'
+  AND query ILIKE '%databasechangelog%';
+```
+
+> **Лайфхак от DevOps:** В Jenkins-пайплайне установите таймаут на этап миграции. Если миграция не завершилась за 10 минут — что-то не так:
+>
+> ```groovy
+> stage('Update DB') {
+>     options {
+>         timeout(time: 10, unit: 'MINUTES')
+>     }
+>     steps {
+>         sh './gradlew update ...'
+>     }
+> }
+> ```
+
+---
+
+## 2. ALTER TABLE на большой таблице = downtime
+
+### Проблема
+
+Вы пишете простой changeset:
+
+```sql
+ALTER TABLE orders ADD COLUMN status VARCHAR(50) NOT NULL DEFAULT 'pending';
+```
+
+На localhost с 10 записями — 5 миллисекунд. На production с 80 миллионами строк — зависит от версии PostgreSQL и от того, что именно вы делаете.
+
+### Что блокирует, а что нет (PostgreSQL 11+)
+
+**Мгновенно (не перезаписывает строки):**
+
+```sql
+-- Добавить колонку с DEFAULT (PG 11+): default хранится в метаданных
+ALTER TABLE orders ADD COLUMN status VARCHAR(50) DEFAULT 'pending';
+
+-- Удалить колонку: помечает как невидимую, не чистит данные сразу
+ALTER TABLE orders DROP COLUMN old_field;
+
+-- Убрать NOT NULL: только метаданные
+ALTER TABLE orders ALTER COLUMN status DROP NOT NULL;
+```
+
+**Медленно и опасно (full table scan / lock):**
+
+```sql
+-- Добавить NOT NULL на существующую колонку с NULL-значениями:
+-- PG проверяет КАЖДУЮ строку
+ALTER TABLE orders ALTER COLUMN status SET NOT NULL;
+
+-- Изменить тип колонки: перезапись каждой строки
+ALTER TABLE orders ALTER COLUMN price TYPE NUMERIC(12,2);
+
+-- Добавить UNIQUE constraint: сканирует всю таблицу
+ALTER TABLE orders ADD CONSTRAINT uq_order_ref UNIQUE (reference);
+```
+
+### Безопасный паттерн для больших таблиц
+
+Вместо одного changeset — три, разнесённых во времени:
+
+```sql
+--liquibase formatted sql
+
+--changeset job4j:050_add_status_column
+-- Шаг 1: добавляем колонку без NOT NULL (мгновенно)
+ALTER TABLE orders ADD COLUMN status VARCHAR(50) DEFAULT 'pending';
+--rollback ALTER TABLE orders DROP COLUMN status;
+```
+
+Между деплоями: бэкфилл (заполнение существующих строк). Это делается **не через Liquibase**, а скриптом приложения или отдельным процессом, батчами:
+
+```sql
+-- Выполняется вручную или через приложение, НЕ через changeset
+UPDATE orders SET status = 'completed'
+WHERE status IS NULL AND id BETWEEN 1 AND 100000;
+-- Повторяйте для следующих батчей
+```
+
+После бэкфилла:
+
+```sql
+--changeset job4j:051_add_status_not_null
+-- Шаг 3: теперь все строки заполнены — ставим NOT NULL
+ALTER TABLE orders ALTER COLUMN status SET NOT NULL;
+--rollback ALTER TABLE orders ALTER COLUMN status DROP NOT NULL;
+```
+
+> **Предупреждение от бэкенд-разработчика:** `UPDATE` на 80 миллионах строк одним запросом — это не просто медленно. Это генерирует WAL-логи размером с саму таблицу, забивает дисковое пространство, и может убить репликацию. Всегда батчами.
+
+### Как узнать размер таблицы
+
+Перед любым ALTER на production — проверяйте:
+
+```sql
+SELECT
+    relname AS table,
+    pg_size_pretty(pg_total_relation_size(oid)) AS total_size,
+    n_live_tup AS row_estimate
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+```
+
+Если таблица больше 1 ГБ или 10 миллионов строк — планируйте миграцию отдельно. Обсуждайте с командой. Тестируйте на staging с реальным объёмом данных.
+
+---
+
+## 3. Backward-compatible миграции
+
+### Зачем
+
+Если у вас blue-green deployment, rolling update, или canary release — в какой-то момент времени работают **две версии** приложения. Обе читают и пишут в одну и ту же БД.
+
+Это значит: миграция не может ломать старую версию приложения.
+
+### Запрещённые операции (без подготовки)
+
+| Операция | Почему опасно |
+|---|---|
+| `RENAME COLUMN` | Старый код обращается по старому имени |
+| `DROP COLUMN` | Старый код SELECT'ит эту колонку |
+| `DROP TABLE` | Старый код обращается к таблице |
+| `ALTER TYPE` (сужение) | `VARCHAR(200)` → `VARCHAR(50)`: старый код пишет длинные строки |
+| `ADD NOT NULL` (без default) | Старый код INSERT'ит без этого поля |
+
+### Паттерн: Expand → Migrate → Contract
+
+Любое ломающее изменение разбивается на три деплоя:
+
+**Деплой 1 — Expand (расширяем):**
+
+Добавляем новое, не убираем старое. Код пишет в оба места.
+
+```sql
+--changeset job4j:060_expand_add_login
+ALTER TABLE users ADD COLUMN login VARCHAR(255);
+```
+
+Код приложения (v2):
+```java
+// Пишем в оба поля
+user.setUsername(value);
+user.setLogin(value);
+// Читаем из нового, если заполнено; иначе из старого
+String name = user.getLogin() != null ? user.getLogin() : user.getUsername();
+```
+
+**Деплой 2 — Migrate (мигрируем данные):**
+
+Заполняем новую колонку из старой. Переключаем чтение.
+
+```sql
+--changeset job4j:061_backfill_login
+UPDATE users SET login = username WHERE login IS NULL;
+```
+
+Код приложения (v3):
+```java
+// Читаем только из login
+// Пишем только в login
+// username больше не трогаем
+```
+
+**Деплой 3 — Contract (убираем старое):**
+
+Старая версия больше нигде не работает. Безопасно удалять.
+
+```sql
+--changeset job4j:062_contract_drop_username
+ALTER TABLE users DROP COLUMN username;
+```
+
+> **Да, это три деплоя вместо одного.** Да, это медленно. Нет, быстрее не получится без downtime. Все крупные компании делают именно так. Netflix, Uber, Spotify — у всех один и тот же паттерн.
+
+---
+
+## 4. Конфликты миграций в команде
+
+### Проблема
+
+Два разработчика создают миграцию с порядковым номером `005`:
+
+- Ветка feature-A: `005_ddl_create_payments.sql`
+- Ветка feature-B: `005_ddl_create_notifications.sql`
+
+Оба мержат в main. Liquibase не упадёт (он не смотрит на номера файлов), но порядок может быть непредсказуемым, а в `db.changelog-master.xml` будет конфликт мержа.
+
+### Решение 1: Timestamp в имени файла
+
+Вместо порядковых номеров — timestamp:
+
+```
+20260327_1400_ddl_create_payments.sql
+20260327_1530_ddl_create_notifications.sql
+```
+
+Конфликты имён практически невозможны. Порядок выполнения определяется по времени создания.
+
+### Решение 2: includeAll вместо include
+
+Замените перечисление каждого файла на автоподхват:
+
+```xml
+<databaseChangeLog ...>
+    <includeAll path="changeset/"
+                relativeToChangelogFile="true"/>
+</databaseChangeLog>
+```
+
+`includeAll` подбирает все файлы в директории по алфавитному порядку. С timestamp-именами — это хронологический порядок.
+
+Минус: вы теряете явный контроль над порядком. Для большинства проектов это приемлемый трейдофф.
+
+### Решение 3: Ревью миграций как отдельный checklist
+
+На code review для PR с миграциями проверяйте:
+
+- Есть ли rollback-секция?
+- Нет ли конфликта имён с другими ветками?
+- Обратно ли совместимо изменение?
+- Есть ли индексы для новых колонок, по которым будет WHERE/JOIN?
+- Не мешает ли DDL и DML в одном changeset?
+- На больших таблицах: был ли замерен размер? Нужен ли `CONCURRENTLY`?
+
+> **Лайфхак:** Создайте шаблон PR-описания для миграций. Разработчик заполняет чеклист перед ревью. Это дисциплинирует и ловит 80% проблем.
+
+---
+
+## 5. DDL и DML: никогда в одном changeset
+
+### Почему это важно
+
+PostgreSQL выполняет DDL внутри транзакции. Но если вы смешиваете DDL и DML, и DML падает — возникает неприятная ситуация.
+
+```sql
+--changeset job4j:070_create_and_seed_roles
+CREATE TABLE roles (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE
+);
+INSERT INTO roles (name) VALUES ('ADMIN'), ('USER'), ('ADMIN');
+-- Дубликат 'ADMIN' → UNIQUE violation → транзакция откатывается
+-- Но changeset помечен как FAILED
+```
+
+Таблица `roles` не создана (транзакция откатилась). Changeset помечен как `FAILED`. При повторном запуске Liquibase попытается выполнить changeset заново — и всё заработает (если вы исправили дубликат). Но в некоторых СУБД или при `runInTransaction:false` — таблица уже создана, и повторный `CREATE TABLE` упадёт.
+
+### Правильная структура
+
+```sql
+-- Файл: 070_ddl_create_roles.sql
+--liquibase formatted sql
+--changeset job4j:070_create_roles
+CREATE TABLE roles (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE
+);
+--rollback DROP TABLE roles;
+```
+
+```sql
+-- Файл: 071_dml_seed_roles.sql
+--liquibase formatted sql
+--changeset job4j:071_seed_roles
+INSERT INTO roles (name) VALUES ('ADMIN'), ('USER');
+--rollback DELETE FROM roles WHERE name IN ('ADMIN', 'USER');
+```
+
+Если `INSERT` упадёт — `CREATE TABLE` уже выполнен и зафиксирован. Исправляете INSERT, запускаете снова — только INSERT выполняется.
+
+---
+
+## 6. Подключение Liquibase к существующей БД (baseline)
+
+### Ситуация
+
+Проект работает полгода. БД создавалась руками или через SQL-скрипты. Миграций нет. Вы решили внедрить Liquibase.
+
+Проблема: Liquibase видит changesets с `CREATE TABLE users` и пытается их выполнить. Таблица уже существует. Ошибка.
+
+### Решение: changelogSync
+
+Шаг 1. Создайте changelog с текущей схемой БД. Можно вручную, можно сгенерировать:
+
+```bash
+./gradlew generateChangelog \
+    -PliquibaseChangelogFile=src/main/resources/db/changelog/changeset/000_baseline.xml
+```
+
+Это создаст XML-файл с текущей схемой (CREATE TABLE, индексы, constraints).
+
+Шаг 2. Добавьте baseline в `db.changelog-master.xml`.
+
+Шаг 3. Выполните `changelogSync` — это пометит ВСЕ changesets как выполненные **без фактического выполнения SQL**:
+
+```bash
+./gradlew changelogSync
+```
+
+Теперь Liquibase "знает" текущее состояние БД. Новые changesets будут выполняться как обычно.
+
+> **Предупреждение:** Запускайте `changelogSync` только на той БД, схема которой соответствует вашему baseline changelog. Если схема отличается — вы получите расхождение между реальной БД и тем, что Liquibase считает выполненным.
+
+### Альтернатива: preconditions
+
+Если вы не хотите делать `changelogSync`, добавьте preconditions к baseline changesets:
+
+```sql
+--liquibase formatted sql
+--changeset job4j:000_create_users
+--preconditions onFail:MARK_RAN
+--precondition-sql-check expectedResult:0 SELECT COUNT(*) FROM information_schema.tables WHERE table_name='users' AND table_schema='public'
+
+CREATE TABLE users (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username VARCHAR(255) NOT NULL
+);
+```
+
+Если таблица уже существует — changeset будет помечен как `MARK_RAN` без выполнения. Если нет — создаст таблицу. Работает на любой БД без ручного `changelogSync`.
+
+---
+
+## 7. Индексы: CONCURRENTLY и runInTransaction
+
+### Проблема
+
+```sql
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+```
+
+Обычный `CREATE INDEX` берёт `SHARE` lock на таблицу. Пока индекс строится — никакие `INSERT`, `UPDATE`, `DELETE` не проходят. На таблице в 50 миллионов строк — это минуты блокировки.
+
+### Решение: CONCURRENTLY
+
+```sql
+--liquibase formatted sql
+--changeset job4j:080_add_index_orders_customer runInTransaction:false
+CREATE INDEX CONCURRENTLY idx_orders_customer ON orders(customer_id);
+--rollback DROP INDEX IF EXISTS idx_orders_customer;
+```
+
+`CONCURRENTLY` строит индекс без блокировки записи. Но у него есть ограничение: **нельзя выполнять внутри транзакции**. Поэтому обязателен `runInTransaction:false`.
+
+### Ловушка: CONCURRENTLY может "зависнуть"
+
+`CREATE INDEX CONCURRENTLY` ждёт завершения всех текущих транзакций. Если есть долгая транзакция (забытый `BEGIN` в psql, зависший процесс) — индекс будет ждать бесконечно.
+
+Проверяйте перед созданием индекса:
+
+```sql
+SELECT pid, state, query_start, now() - query_start AS duration, query
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND query_start < now() - interval '5 minutes';
+```
+
+### Ловушка: CONCURRENTLY может создать INVALID индекс
+
+Если `CREATE INDEX CONCURRENTLY` упадёт (нехватка памяти, deadlock) — индекс останется в состоянии `INVALID`. Он не используется планировщиком, но занимает место и замедляет INSERT.
+
+Проверка:
+
+```sql
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index
+WHERE NOT indisvalid;
+```
+
+Решение: удалить и пересоздать.
+
+```sql
+DROP INDEX CONCURRENTLY idx_orders_customer;
+CREATE INDEX CONCURRENTLY idx_orders_customer ON orders(customer_id);
+```
+
+---
+
+## 8. Мониторинг и диагностика
+
+### Три запроса, которые расскажут всё
+
+Когда миграция сломалась — не надо читать весь лог. Начните с этих запросов:
+
+```sql
+-- 1. Последние выполненные changesets
+SELECT id, author, filename, dateexecuted, exectype, orderexecuted
+FROM databasechangelog
+ORDER BY orderexecuted DESC
+LIMIT 10;
+
+-- 2. Есть ли FAILED changesets?
+SELECT id, author, filename, dateexecuted, description
+FROM databasechangelog
+WHERE exectype = 'FAILED';
+
+-- 3. Кто держит lock?
+SELECT locked, lockgranted, lockedby
+FROM databasechangeloglock;
+```
+
+### Проверка в CI/CD pipeline
+
+Добавьте этап верификации после миграции:
+
+```groovy
+stage('Verify Migration') {
+    steps {
+        script {
+            def failed = sh(
+                script: '''
+                    PGPASSWORD=$DB_PASSWORD psql -h db -U postgres -d job4j_devops \
+                        -t -A -c "SELECT COUNT(*) FROM databasechangelog WHERE exectype = 'FAILED'"
+                ''',
+                returnStdout: true
+            ).trim()
+            if (failed != '0') {
+                error "Found ${failed} FAILED migration(s)!"
+            }
+        }
+    }
+}
+```
+
+### Алерт на долгие миграции
+
+Если миграция выполняется дольше 30 секунд — это повод разобраться:
+
+```sql
+SELECT id, filename,
+       dateexecuted,
+       deployment_id,
+       description
+FROM databasechangelog
+WHERE dateexecuted > now() - interval '1 hour'
+ORDER BY dateexecuted DESC;
+```
+
+---
+
+## 9. Безопасное удаление таблиц и колонок
+
+### Правило трёх недель
+
+Никогда не делайте `DROP TABLE` или `DROP COLUMN` сразу. Используйте паттерн "deprecate → verify → drop":
+
+**Неделя 1: переименование**
+
+```sql
+--changeset job4j:090_deprecate_legacy_payments
+ALTER TABLE legacy_payments RENAME TO _deprecated_legacy_payments_20260327;
+```
+
+Если какой-то забытый сервис, cron-job или отчёт обращался к этой таблице — он упадёт. Вы узнаете об этом из алертов, а не из потери данных.
+
+**Неделя 2-3: наблюдение**
+
+Мониторьте ошибки в логах приложения. Если за две недели никто не пожаловался — таблица действительно не используется.
+
+**Неделя 3+: удаление**
+
+```sql
+--changeset job4j:095_drop_deprecated_legacy_payments
+DROP TABLE _deprecated_legacy_payments_20260327;
+```
+
+> **Лайфхак:** Перед DROP сделайте `pg_dump` только этой таблицы. Если через месяц окажется, что данные нужны — восстановите из дампа, а не из полного бэкапа.
+
+### Для колонок — тот же принцип
+
+```sql
+-- Шаг 1: перестаём читать колонку в коде (деплой v1)
+-- Шаг 2: перестаём писать в колонку (деплой v2)
+
+-- Шаг 3: ставим DEFAULT NULL, убираем NOT NULL
+--changeset job4j:091_relax_old_status
+ALTER TABLE orders ALTER COLUMN old_status DROP NOT NULL;
+ALTER TABLE orders ALTER COLUMN old_status SET DEFAULT NULL;
+
+-- Шаг 4: через 2 недели — удаляем
+--changeset job4j:096_drop_old_status
+ALTER TABLE orders DROP COLUMN old_status;
+```
+
+---
+
+## 10. Чеклист: перед выполнением миграции на production
+
+Распечатайте и повесьте рядом с монитором:
+
+```
+□  Миграция протестирована на staging с production-like данными
+□  ./gradlew validate — прошёл без ошибок
+□  ./gradlew updateSql — прочитан и проверен сгенерированный SQL
+□  Есть rollback-секция для каждого changeset
+□  rollback протестирован: update → rollback → update работает
+□  Бэкап БД сделан ДО миграции
+□  Тег поставлен: ./gradlew tag -PliquibaseTag=<release-version>
+□  ALTER на большие таблицы: размер проверен, CONCURRENTLY если нужно
+□  DDL и DML в разных changesets
+□  Нет ломающих изменений (RENAME/DROP) без expand-contract
+□  Команда оповещена о предстоящей миграции
+□  Мониторинг и алерты включены
+□  План отката готов и задокументирован
+```
+
+---
+
+## Итого
+
+| Грабли | Как избежать |
+|---|---|
+| Залипший lock | `releaseLocks` + таймаут в Jenkins |
+| ALTER на большой таблице | Проверять размер, разбивать на этапы, `CONCURRENTLY` |
+| Сломал старую версию приложения | Expand → Migrate → Contract |
+| Конфликт номеров миграций | Timestamp в имени + `includeAll` |
+| DDL + DML в одном changeset | Разделять: структура отдельно, данные отдельно |
+| Внедрение в существующий проект | `changelogSync` или preconditions |
+| CREATE INDEX заблокировал таблицу | `CONCURRENTLY` + `runInTransaction:false` |
+| Не понятно что сломалось | 3 диагностических SQL-запроса |
+| DROP уничтожил нужные данные | Rename → 2 недели → Drop |
+| Миграция упала на production | Чеклист перед деплоем |
+
+---
+
+## Задание
+
+Это задание — симуляция реальной production-ситуации:
+
+1. Создайте таблицу `orders` с колонками `id`, `user_id (FK)`, `amount`, `created_at`.
+2. Вставьте 5 тестовых записей (отдельный changeset с `context:dev`).
+3. Добавьте колонку `status` с DEFAULT — без NOT NULL.
+4. Создайте индекс на `user_id` с `CONCURRENTLY` и `runInTransaction:false`.
+5. Выполните `./gradlew update`.
+6. Откатите 2 последних changeset через `rollbackCount`.
+7. Убедитесь, что индекс и колонка `status` исчезли, а таблица `orders` на месте.
+8. Выполните `./gradlew update` повторно — всё должно примениться снова.
+9. Загрузите результат в репозиторий.
